@@ -2,5 +2,7 @@
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 (echo [asan] vcvars64 not found & exit /b 1)
 if not exist build mkdir build
-cl /nologo /std:c17 /W3 /wd4244 /wd4267 /I include /Od /Zi /fsanitize=address src\benchmark.c src\common.c src\dijkstra.c src\bellman_ford.c src\chd.c dmmsy\dmmsy_common.c dmmsy\dmmsy_opt.c /Fe:build\bench_asan.exe || exit /b 1
+REM DMMSY upstream compiled verbatim from the ref-dmmsy submodule via the port header
+cl /nologo /std:c17 /W3 /wd4244 /wd4267 /I include /Od /Zi /fsanitize=address /FI dmmsy_port.h /c ref-dmmsy\src\common.c ref-dmmsy\src\dmmsy_opt.c /Fo:build\ || exit /b 1
+cl /nologo /std:c17 /W3 /wd4244 /wd4267 /I include /Od /Zi /fsanitize=address src\benchmark.c src\common.c src\dijkstra.c src\bellman_ford.c src\chd.c build\common.obj build\dmmsy_opt.obj /Fe:build\bench_asan.exe || exit /b 1
 echo [asan] build\bench_asan.exe

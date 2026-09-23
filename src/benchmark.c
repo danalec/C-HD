@@ -13,7 +13,15 @@
  */
 
 #include "../include/chd.h"
-#include "../dmmsy/dmmsy.h"
+#include "dmmsy_port.h"
+/* dmmsy_port.h renames the upstream Edge/CSRGraph/random_graph/free_graph
+ * while parsing their header; undo the macros so this TU keeps using this
+ * project's own symbols. DmCSRGraph and ssp_duan (from the port header)
+ * stay visible for the DMMSY call below. */
+#undef Edge
+#undef CSRGraph
+#undef random_graph
+#undef free_graph
 
 #include <stdio.h>
 #include <stdlib.h>

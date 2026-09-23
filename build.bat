@@ -43,9 +43,9 @@ if "%TARGET%"=="tests" goto :eof
 
 :bench
 set DOBJS=
-for %%S in (dmmsy\dmmsy_common.c dmmsy\dmmsy_opt.c) do (
-  set OBJ=build\%CONF%\%%~nS.obj
-  cl %CFLAGS% /c %%S /Fo!OBJ! || exit /b 1
+for %%S in (ref-dmmsy\src\common.c ref-dmmsy\src\dmmsy_opt.c) do (
+  set OBJ=build\%CONF%\dmmsy_%%~nS.obj
+  cl %CFLAGS% /FI dmmsy_port.h /c %%S /Fo!OBJ! || exit /b 1
   set DOBJS=!DOBJS! !OBJ!
 )
 cl %CFLAGS% src\benchmark.c %OBJS% %DOBJS% /Fe:build\%CONF%\chd_bench.exe || exit /b 1

@@ -1,3 +1,6 @@
 [submodule "ref-chd-proof"]
 	path = ref-chd-proof
 	url = https://github.com/spicylemonade/c-hd-proof.git
+[submodule "ref-dmmsy"]
+	path = ref-dmmsy
+	url = https://github.com/danalec/DMMSY-SSSP.git
