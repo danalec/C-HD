@@ -1,0 +1,3 @@
+[submodule "ref-chd-proof"]
+	path = ref-chd-proof
+	url = https://github.com/spicylemonade/c-hd-proof.git
