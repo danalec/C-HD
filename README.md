@@ -198,3 +198,8 @@ results/             final CSV + figures
 ref-chd-proof/       paper draft and Lean spec (git submodule of the public proof repo)
 ref-dmmsy/           local clone of DMMSY-SSSP (not committed; see dmmsy/)
 ```
+
+## License
+
+This project is dual-licensed under the **MIT License** and **Apache License 2.0**. See the `LICENSE-MIT` and `LICENSE-APACHE` files for details. The vendored DMMSY sources in `dmmsy/` keep their upstream dual license (notice files in that directory).
+
