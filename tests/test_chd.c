@@ -225,6 +225,28 @@ static void test_determinism(void) {
     printf("[determinism] done\n");
 }
 
+/* Parameter sweep (FIX-SIGROW coverage): the adaptive t always collapses the
+ * recursion to L = 1 for every n the suite builds, so BM.12's expansion path
+ * -- the one that appends group members past the pull-sized Si -- is never
+ * reached without an explicit override.  A fixed small t makes
+ * L = floor(lgN/t) + 1 grow, which is exactly the regime where |group| can
+ * exceed the pull count.  Exactness must hold for every t. */
+static void test_t_sweep(void) {
+    uint64_t seed = 0x7531;
+    node_t n = 30000, m = 8 * n;
+    CSRGraph g = random_graph(n, m, 100.0, seed);
+    char tag[32];
+    /* every t that can reach the 3k <= t bump, plus a few above it */
+    for (uint32_t t = 1; t <= 20; t++) {
+        chd_set_t_override(t);
+        snprintf(tag, sizeof(tag), "t=%u", t);
+        run_case(tag, &g, 999, 1, seed);
+    }
+    chd_set_t_override(0);          /* back to the adaptive default */
+    free_graph(&g);
+    printf("[t-sweep] t = 1..20 ok\n");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -236,6 +258,7 @@ int main(void) {
     test_dispatch_window();
     test_determinism();
     test_large_forced();
+    test_t_sweep();
     double t1 = now_seconds();
     printf("----------------------------------------\n");
     printf("checks: %d   failures: %d   time: %.2fs\n", g_checks, g_fail, t1 - t0);

@@ -107,6 +107,10 @@ int main(int argc, char **argv) {
     g_pp   = malloc(MAXN * sizeof(node_t));
 
     FILE *csv = fopen("bench_results.csv", "w");
+    if (!csv) {
+        fprintf(stderr, "cannot write bench_results.csv in the current directory\n");
+        return 2;
+    }
     fprintf(csv, "n,m_ratio,algo,time_min_s,time_median_s\n");
 
     printf("%-10s %-7s | %-14s | %-14s | %-14s\n",

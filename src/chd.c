@@ -23,9 +23,9 @@
  * Labels are the paper's 5-tuples reduced to what the C code needs:
  * (len, hops, eid) ordered lexicographically; eid is the CSR slot id, which
  * plays the role of the (v, e) tie-break of the walk order kappa.  The
- * version field `a = ver[tail e]` of the formal label is maintained in
- * ver[] but is not consulted: with scan-once pointer windows (Lemma H0')
- * the same edge cannot re-fire a re-confirmation after its tail is complete.
+ * version field `a = ver[tail e]` of the formal label is not materialized:
+ * with scan-once pointer windows (Lemma H0') the same edge cannot re-fire a
+ * re-confirmation after its tail is complete, so no read ever needed it.
  *
  * Practical deviations from the formalized program (all complexity-neutral
  * or better, documented here so nothing is overclaimed):
@@ -75,7 +75,7 @@ static inline int lbl_le(Label a, Label b) { return lbl_cmp(a, b) <= 0; }
 /* Relax (paper Sec 3.1): valid iff cand <= d[v] and cand < B.
  * ok = 1 on cand <= d[v] (equality re-confirms): callers rely on this to
  * (re)admit vertices first relaxed by FindPivots searches into the heap /
- * DS' — only a STRICT decrease rewrites d[v], bumps ver[v] and records the
+ * DS' — only a STRICT decrease rewrites d[v] and records the
  * predecessor chunk's original vertex.
  * Settled vertices (ustamp != 0; real or virtual FindPivots settlements) are
  * permanently deleted (Lemma L) and are refused here centrally: no caller
@@ -85,20 +85,20 @@ static inline int lbl_le(Label a, Label b) { return lbl_cmp(a, b) <= 0; }
  * proved cand < B against its break/window check, so this hot path takes
  * cand as an argument and elides the redundant B test; one lbl_cmp against
  * d[v] serves both the <= admission and the strict-decrease test. */
-static inline int chd_relax(Label *dv, uint32_t *ver, uint32_t *pred_out,
+static inline int chd_relax(Label *dv, uint32_t *pred_out,
                             uint32_t pred_val, Label cand, uint32_t head,
                             const uint32_t *ust) {
     if (ust[head]) return 0;
     int c = lbl_cmp(cand, *dv);
     if (c > 0) return 0;
     if (c < 0) {
-        *dv = cand; (*ver)++;
+        *dv = cand;
         if (pred_out) *pred_out = pred_val;
     }
     return 1;
 }
 #define RELAX(W, v, u, cand) \
-    chd_relax(&W->d[v], &W->ver[v], &W->pred[v], W->g.orig[u], cand, v, W->ustamp)
+    chd_relax(&W->d[v], &W->pred[v], W->g.orig[u], cand, v, W->ustamp)
 
 /* ------------------------------------------------------------------ */
 /* Reduced graph (P1-P4)                                               */
@@ -148,7 +148,6 @@ typedef struct {
     Red g;
     node_t   *kid;     /* n: kept id per original vertex (or NONE32) */
     Label    *d;       /* N: current labels                    */
-    uint32_t *ver;     /* N: version counters                  */
     uint32_t *ptr;     /* N: next static slot to scan          */
     uint32_t *pred;    /* N: predecessor original vertex       */
     uint32_t *live_ent;/* N: live entry index or NONE32        */
@@ -156,7 +155,6 @@ typedef struct {
     uint32_t ctr;
     uint32_t *fmark;   /* FH.3/FH.10: in a tree of this invocation */
     uint32_t *kst;     /* FH.15: in current search's K             */
-    uint32_t *valst;   /* FH.17/20/22: in current search's val     */
     uint32_t *treeof;  /* tree index of fmarked vertex (inv-local) */
     uint32_t *wstamp;  /* MP.9 W dedupe                            */
     uint32_t *inSst;   /* MP.2                                     */
@@ -187,7 +185,7 @@ typedef struct {
     Label   *ih_key;   node_t *ih_id;   uint64_t ih_cap;    /* base-case heap */
     uint32_t *pull_consumed; uint64_t pull_consumed_cap;
     uint32_t *merge_nb;      uint64_t merge_nb_cap;
-    DStr    *dstr_pool;  uint32_t dstr_pool_n, dstr_pool_cap; /* recycled DS' */
+    uint32_t **dstr_pool; uint32_t dstr_pool_n, dstr_pool_cap; /* recycled blists */
     node_t **upool;      uint32_t *ucap;                      /* buffer sizes  */
     uint32_t upool_n, upool_cap;                              /* recycled U bufs */
     /* stats */
@@ -281,18 +279,32 @@ static void chd_params(Chd *W, node_t N, node_t gM) {
             t++;
     }
     uint32_t k = (uint32_t)ceil(sqrt((double)t));
-    if (3 * k > t) t = 3 * k;               /* FIX-L13: 3k <= t */
+    /* FIX-L13: 3k <= t.  Growing t must re-derive k, otherwise the call runs
+     * with a k that no longer equals ceil(sqrt(t)): the override t=4 gave
+     * k=2 with t=6, and the k=2 group regime produced WRONG distances (197.11
+     * where Dijkstra says 148.08, n=30000).  The loop converges because
+     * k' = ceil(sqrt(3k)) <= k for every k >= 3, so t stops growing at 9. */
+    while (3 * k > t) {
+        uint32_t t0 = t;
+        t = 3 * k;
+        k = (uint32_t)ceil(sqrt((double)t));
+        if (t == t0) break;                /* defensive: never spin */
+    }
     W->t = t; W->k = k;
     uint32_t L = (uint32_t)(floor(lgN / (double)t) + 1.0);
     W->L = L;
     W->Mtab  = (uint64_t *)xrealloc(W->Mtab, (L + 1) * sizeof(uint64_t));
     W->Lam   = (uint64_t *)xrealloc(W->Lam,  (L + 1) * sizeof(uint64_t));
+    double td = (double)t;
     for (uint32_t l = 0; l <= L; l++) {
-        W->Mtab[l] = clamp_u64((double)t * ldexp(1.0, (int)((l ? l - 1 : 0)) * (int)t) /
-                               (l == 0 ? (double)(1u << t) : 1.0));
-        if (l == 0) W->Mtab[l] = 1;                    /* M_0 = 1 */
-        if (l >= 1) W->Mtab[l] = clamp_u64((double)t * ldexp(1.0, (int)(l - 1) * (int)t));
-        W->Lam[l] = clamp_u64(pow((double)t, 3.0) * ldexp(1.0, (int)l * (int)t));
+        /* FIX-UBM0: M_l = t * 2^{(l-1)t} for l >= 1 and M_0 = 1.  The first
+         * store used to be dead (both branches below overwrote it) yet still
+         * evaluated (double)(1u << t), which is undefined once the shift count
+         * reaches 32 -- and the adaptive t does exactly that from n = 2^17 up
+         * (t = 2*cbrt(n) = 512 at 2^21).  MSVC masked the count mod 32 so the
+         * dead value never showed; the shift itself was still UB. */
+        W->Mtab[l] = (l == 0) ? 1 : clamp_u64(td * ldexp(1.0, (int)(l - 1) * (int)t));
+        W->Lam[l] = clamp_u64(td * td * td * ldexp(1.0, (int)l * (int)t));
     }
 }
 
@@ -376,7 +388,8 @@ static void perm_ms(uint32_t *a, uint32_t *t, node_t n) {
     while (i < m) a[o++] = t[i++];
     while (j < n) a[o++] = t[j++];
 }
-static void slot_sort(Chd *W, node_t lo, node_t hi, uint32_t *perm, uint32_t *tmp) {
+static void slot_sort(Chd *W, node_t lo, node_t hi, uint32_t *perm, uint32_t *tmp,
+                      node_t *gh_buf, weight_t *gw_buf) {
     node_t n = hi - lo;
     if (n < 2) return;
     if (n <= 32) {
@@ -400,12 +413,12 @@ static void slot_sort(Chd *W, node_t lo, node_t hi, uint32_t *perm, uint32_t *tm
     for (node_t i = 0; i < n; i++) perm[i] = lo + (node_t)i;
     g_sortW = W;
     perm_ms(perm, tmp, n);
-    node_t *nh = (node_t *)malloc(n * sizeof(node_t));
-    weight_t *nw = (weight_t *)malloc(n * sizeof(weight_t));
-    for (node_t i = 0; i < n; i++) { nh[i] = W->g.gHead[perm[i]]; nw[i] = W->g.gW[perm[i]]; }
-    memcpy(W->g.gHead + lo, nh, n * sizeof(node_t));
-    memcpy(W->g.gW + lo, nw, n * sizeof(weight_t));
-    free(nh); free(nw);
+    /* scratch comes from the caller (one allocation per preprocess instead of
+     * one malloc/free pair per chunk: degrees above 32 are common at large n
+     * even for a mean degree of 8, and the allocator shows up in P4) */
+    for (node_t i = 0; i < n; i++) { gh_buf[i] = W->g.gHead[perm[i]]; gw_buf[i] = W->g.gW[perm[i]]; }
+    memcpy(W->g.gHead + lo, gh_buf, n * sizeof(node_t));
+    memcpy(W->g.gW + lo, gw_buf, n * sizeof(weight_t));
 }
 
 /* Build the reduced graph per P1-P4. */
@@ -567,9 +580,11 @@ static void chd_preprocess(Chd *W, const CSRGraph *g, node_t src) {
     }
     uint32_t *perm = (uint32_t *)malloc((maxdeg ? maxdeg : 1) * sizeof(uint32_t));
     uint32_t *ptmp = (uint32_t *)malloc((maxdeg ? maxdeg : 1) * sizeof(uint32_t));
+    node_t *gbuf = (node_t *)malloc((maxdeg ? maxdeg : 1) * sizeof(node_t));
+    weight_t *wbuf = (weight_t *)malloc((maxdeg ? maxdeg : 1) * sizeof(weight_t));
     for (node_t x = 0; x < N; x++)
-        PROF(11, slot_sort(W, G->gSt[x], G->gSt[x + 1], perm, ptmp));
-    free(perm); free(ptmp);
+        PROF(11, slot_sort(W, G->gSt[x], G->gSt[x + 1], perm, ptmp, gbuf, wbuf));
+    free(perm); free(ptmp); free(gbuf); free(wbuf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -580,30 +595,35 @@ static void dstr_init(DStr *D, uint64_t M, Label bound) {
     D->blist = NULL; D->nb = 0; D->cap = 0; D->M = M; D->bound = bound;
     D->live_total = 0;
 }
-static void dstr_free(DStr *D) { free(D->blist); D->blist = NULL; D->nb = D->cap = 0; }
 
 /* DS' recycling: thousands of base-case calls each need a fresh level-0 DS'.
- * They are used strictly sequentially, so popped structs (with their blist
- * buffers) go back to a workspace free-list instead of malloc/free. */
+ * Only the blist buffers -- the real allocations -- are recycled; the 48-byte
+ * DStr header is always its own malloc so that a DStr handed back through
+ * ret->D keeps a STABLE address.  Pooling the headers instead made them live
+ * inside a movable array: dstr_recycle's own realloc then relocated the array
+ * under a live DStr, and the following `*D` copy read freed memory (ASan:
+ * heap-use-after-free, 3024 bytes inside the 64-entry pool). */
 static DStr *dstr_alloc(Chd *W, uint64_t M, Label bound) {
-    DStr *D;
-    if (W->dstr_pool_n > 0) {
-        D = &W->dstr_pool[--W->dstr_pool_n];
-        D->nb = 0; D->M = M; D->bound = bound; D->live_total = 0;
-    } else {
-        D = (DStr *)malloc(sizeof(DStr));
-        dstr_init(D, M, bound);
-    }
+    DStr *D = (DStr *)malloc(sizeof(DStr));
+    dstr_init(D, M, bound);
+    if (W->dstr_pool_n > 0) D->blist = W->dstr_pool[--W->dstr_pool_n];
     return D;
 }
+/* hand the blist buffer back; the header is left alone (stack-owned for the
+ * caller's own D, freed by dstr_release for a malloc'd one) */
 static void dstr_recycle(Chd *W, DStr *D) {
-    D->nb = 0;
-    if (W->dstr_pool_n == W->dstr_pool_cap) {
-        W->dstr_pool_cap = W->dstr_pool_cap ? W->dstr_pool_cap * 2 : 64;
-        W->dstr_pool = (DStr *)xrealloc(W->dstr_pool, W->dstr_pool_cap * sizeof(DStr));
+    if (D->blist) {
+        if (W->dstr_pool_n == W->dstr_pool_cap) {
+            W->dstr_pool_cap = W->dstr_pool_cap ? W->dstr_pool_cap * 2 : 64;
+            W->dstr_pool = (uint32_t **)xrealloc(W->dstr_pool,
+                                                (size_t)W->dstr_pool_cap * sizeof(uint32_t *));
+        }
+        W->dstr_pool[W->dstr_pool_n++] = D->blist;
     }
-    W->dstr_pool[W->dstr_pool_n++] = *D;
+    D->blist = NULL; D->nb = 0; D->cap = 0;
 }
+/* recycle a DStr whose header came from dstr_alloc */
+static void dstr_release(Chd *W, DStr *D) { dstr_recycle(W, D); free(D); }
 
 /* U-buffer recycling (same lifetime argument as the DS' pool). */
 static node_t *upool_alloc(Chd *W, uint64_t *cap_out) {
@@ -1047,7 +1067,6 @@ typedef struct FPB {
     node_t *Ux;      /* virtual settlements of all runs this invocation */
     uint32_t Ux_n, Ux_cap;
     node_t *Q;  uint32_t Q_n, Q_cap;
-    node_t *Wl; uint32_t Wl_n, Wl_cap;  /* concatenated Wlist (deduped) */
 } FPB;
 
 static void fpb_reset(FPB *f, uint32_t k, uint32_t Ssz) {
@@ -1074,8 +1093,7 @@ static void fpb_reset(FPB *f, uint32_t k, uint32_t Ssz) {
     if (f->Ux_cap < Ssz + 2) { f->Ux_cap = 2 * (Ssz + 2); f->Ux = (node_t *)xrealloc(f->Ux, f->Ux_cap * sizeof(node_t)); }
     f->Ux_n = 0;
     if (f->Q_cap < Ssz + 2) { f->Q_cap = Ssz + 2; f->Q = (node_t *)xrealloc(f->Q, f->Q_cap * sizeof(node_t)); }
-    if (f->Wl_cap < Ssz + 2) { f->Wl_cap = 2 * (Ssz + 2); f->Wl = (node_t *)xrealloc(f->Wl, f->Wl_cap * sizeof(node_t)); }
-    f->Q_n = f->Wl_n = 0;
+    f->Q_n = 0;
 }
 
 /* extract-min of the unsorted search heap H[0..hn): scans current labels */
@@ -1200,7 +1218,7 @@ static void fh_search(Chd *W, FPB *f, node_t x, Label B, Label LX,
     } else if (kn < KMAX && f->Ux_n - ux0 < k && hn == 0) {
         /* FB.18/FD.19 failed: ball exhausted, < k settlements, no hit */
         f->Q[f->Q_n++] = x;
-        /* W gets Ux (all runs share f->Ux -> f->Wl in find_pivots) */
+        /* W gets Ux (all runs share f->Ux; find_pivots dedups it into W) */
     } else {                                            /* FB.15: new tree */
         uint32_t tv = f->t_n++;
         f->thead[tv] = NONE32;
@@ -1561,16 +1579,14 @@ static void base_case(Chd *W, Call *c, Label B, node_t *S, uint64_t Ssz,
             if (W->ustamp[v]) continue;
             Label cand; cand.len = clen; cand.hops = du.hops + 1; cand.eid = s;
             if (!lbl_lt(cand, B)) break;                /* window */
-            /* BC.7: settle scan of the static range prefix below B.
-             * D0 is intentionally NOT maintained during the loop: an unsettled
-             * S-member or relaxed vertex is always still keyed in the heap, so
-             * at BC.8 the heap contents alone reproduce D0 exactly (settled keys
-             * were popped; never-settled keys remain). */
             int ok = RELAX(W, v, u, cand);
             /* settle scans may re-encounter already-settled vertices by
              * equality: ok stays 1, but they must never re-enter the heap. */
-            /* ok==1 implies ustamp[v]==0 (chd_relax refuses settled heads) */
-            if (ok) ih_decrease(W, &c->heap, v, W->d[v]);
+            /* ok==1 implies ustamp[v]==0 (chd_relax refuses settled heads).
+             * On ok, d[v] == cand: a strict decrease wrote cand, and equality
+             * means cand WAS d[v], so the heap can take cand without reloading
+             * W->d[v]. */
+            if (ok) ih_decrease(W, &c->heap, v, cand);
             stop = s + 1;
         });
         W->ptr[u] = stop;
@@ -1686,6 +1702,17 @@ static void bmssp(Chd *W, Label B, node_t *S, uint64_t Ssz, uint32_t level,
                 if (!lbl_lt(W->d[v], Bi)) continue;
                 if (W->siddup[v] == si_st) continue;
                 W->siddup[v] = si_st;
+                /* FIX-SIGROW: Si is sized from the pull count cnt, but the
+                 * expansion appends one entry per surviving group member, and
+                 * a group reaches up to |tree| (partition_tree only cuts when
+                 * |Uv| >= s, so one child subtree can be merged whole).  With
+                 * cnt << |group| the two bounds disagree and c.Si[sn++] ran
+                 * off the buffer (reachable whenever L >= 2, e.g. a fixed
+                 * small t via CHD_T, where Ssz grows past KMAX). */
+                if (sn == c.Sicap) {
+                    c.Sicap = c.Sicap * 2 + 64;
+                    c.Si = (node_t *)xrealloc(c.Si, c.Sicap * sizeof(node_t));
+                }
                 c.Si[sn++] = v;
             }
         }
@@ -1695,7 +1722,7 @@ static void bmssp(Chd *W, Label B, node_t *S, uint64_t Ssz, uint32_t level,
         bmssp(W, Bi, c.Si, sn, level - 1, W->Lam[level - 1], &r);
         /* BM.14: merge child's D */
         dstr_merge(W, D, r.D);
-        dstr_recycle(W, r.D);
+        dstr_release(W, r.D);          /* child's DStr header is malloc'd */
         /* BM.15: delete U_i keys.  With zero live entries in D every delete
          * returns immediately (live_ent[v] is NONE32 or stale), so the whole
          * O(|U_i|) walk is skipped — typical of the collapsed regime where
@@ -1731,8 +1758,14 @@ static void bmssp(Chd *W, Label B, node_t *S, uint64_t Ssz, uint32_t level,
         /* BM.19-BM.22: settle scans */
         for (uint64_t i = 0; i < r.Un; i++) {
             node_t u = r.U[i];
-            Label du = W->d[u];
             node_t s = W->ptr[u], e = G->gSt[u + 1];
+            /* ptr[u] == e means this vertex's static range was already
+             * scanned to the end by whoever settled it (base_case commits the
+             * resume pointer).  d[u] is final once settled, so re-running the
+             * loop from e is a guaranteed no-op -- skip the label load and
+             * the store instead. */
+            if (s >= e) continue;
+            Label du = W->d[u];
             const int has_del = G->ghas_del;
             PROF(8, for (; s < e; s++) {
                 if (has_del && G->gdel[s]) continue;    /* Lemma L deleted */
@@ -1807,8 +1840,9 @@ static void bmssp(Chd *W, Label B, node_t *S, uint64_t Ssz, uint32_t level,
         }
         for (uint64_t i = 0; i < wn; i++) {
             node_t u = c.Wp[i];
-            Label du = W->d[u];
             node_t s = W->ptr[u], e = G->gSt[u + 1];
+            if (s >= e) continue;                  /* range already exhausted */
+            Label du = W->d[u];
             const int has_del = G->ghas_del;
             PROF(13, for (; s < e; s++) {
                 if (has_del && G->gdel[s]) continue;    /* Lemma L deleted */
@@ -1858,9 +1892,9 @@ static void chd_free_workspace(Chd *W) {
     free(W->g.gSt); free(W->g.gHead); free(W->g.gW); free(W->g.gdel);
     free(W->g.gRep); free(W->g.orig);
     free(W->kid);
-    free(W->d); free(W->ver); free(W->ptr); free(W->pred);
+    free(W->d); free(W->ptr); free(W->pred);
     free(W->live_ent);
-    free(W->fmark); free(W->kst); free(W->valst); free(W->treeof);
+    free(W->fmark); free(W->kst); free(W->treeof);
     free(W->wstamp); free(W->inSst); free(W->inQst); free(W->asgst);
     free(W->ustamp); free(W->pm_top); free(W->hpos); free(W->siddup);
     free(W->tparent); free(W->tedge);
@@ -1869,14 +1903,14 @@ static void chd_free_workspace(Chd *W) {
     if (W->fpb) {
         free(W->fpb->tv); free(W->fpb->thead); free(W->fpb->tcnt);
         free(W->fpb->H); free(W->fpb->K); free(W->fpb->kpar); free(W->fpb->kedge);
-        free(W->fpb->Q); free(W->fpb->Wl);
+        free(W->fpb->Q);
         free(W->fpb);
         W->fpb = NULL;
     }
     /* release the hot-path scratch pools */
     free(W->ih_key); free(W->ih_id);
     free(W->pull_consumed); free(W->merge_nb);
-    for (uint32_t i = 0; i < W->dstr_pool_n; i++) free(W->dstr_pool[i].blist);
+    for (uint32_t i = 0; i < W->dstr_pool_n; i++) free(W->dstr_pool[i]);
     free(W->dstr_pool);
     for (uint32_t i = 0; i < W->upool_n; i++) free(W->upool[i]);
     free(W->upool); free(W->ucap);
@@ -1888,13 +1922,11 @@ static void chd_setup_workspace(Chd *W) {
     node_t N = W->g.N;
     size_t sz = (size_t)(N ? N : 1);
     W->d        = (Label *)xrealloc(W->d, sz * sizeof(Label));
-    W->ver      = (uint32_t *)calloc(sz, sizeof(uint32_t));
     W->ptr      = (uint32_t *)xrealloc(W->ptr, sz * sizeof(uint32_t));
     W->pred     = (uint32_t *)xrealloc(W->pred, sz * sizeof(uint32_t));
     W->live_ent = (uint32_t *)xrealloc(W->live_ent, sz * sizeof(uint32_t));
     W->fmark    = (uint32_t *)calloc(sz, sizeof(uint32_t));
     W->kst      = (uint32_t *)calloc(sz, sizeof(uint32_t));
-    W->valst    = (uint32_t *)calloc(sz, sizeof(uint32_t));
     W->treeof   = (uint32_t *)calloc(sz, sizeof(uint32_t));
     W->wstamp   = (uint32_t *)calloc(sz, sizeof(uint32_t));
     W->inSst    = (uint32_t *)calloc(sz, sizeof(uint32_t));
@@ -1939,7 +1971,7 @@ static int chd_run(Chd *W, const CSRGraph *g, node_t src, weight_t *dist, node_t
         Ret r;
         PROF(1, bmssp(W, LBL_INF, S0, 1, W->L, W->Lam[W->L], &r));
         if (r.U) upool_recycle(W, r.U, r.Ucap);
-        dstr_recycle(W, r.D);
+        dstr_release(W, r.D);
     }
 
     /* P5: map virtual labels back to original vertices */

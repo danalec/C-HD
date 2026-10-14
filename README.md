@@ -30,7 +30,7 @@ build.bat Release tests    :: optimized suite
 build.bat Release bench    :: C-HD vs DMMSY vs Dijkstra benchmark
 build.bat Release all      :: both
 
-build\Release\test_chd.exe            :: 126 checks vs Dijkstra
+build\Release\test_chd.exe            :: 146 checks vs Dijkstra
 build\Release\chd_bench.exe 21 5      :: up to n=2^21, 5 repetitions
 set CHD_T=128 && build\Release\chd_bench.exe   :: try a fixed t (0 = adaptive)
 ```
@@ -71,8 +71,9 @@ python scripts\plot_bench.py   :: regenerate results/fig_*.png from the CSV
 3. **Adaptive `t`**: the paper fixes `t ≥ 16`; empirically the recursion
    degenerated into ~N/t tiny calls whose fixed cost dominates. We use
    `t = max(paper, ⌈2·cbrt(N)⌉)`, ~2× faster across the whole window.
-   Exactness is independent of `t` (all 126 checks pass) and the certified
-   invariant `lgN² ≤ t³·dd²` is only strengthened by a larger `t`.
+   Exactness is independent of `t` — the suite now pins it explicitly with a
+   `t = 1..20` sweep (see below) — and the certified invariant
+   `lgN² ≤ t³·dd²` is only strengthened by a larger `t`.
 4. **Base-case DS' built lazily** at BC.8 from the heap contents (equivalent:
    an unsettled key is always still keyed in the heap).
 5. **Global stale semantics** for O(1) deletes (FIX-STALE), a `gdel` bitmap
@@ -123,12 +124,64 @@ Dijkstra controls): the remaining time is dominated by the 16-byte-label
 Dijkstra (59%) and the memory-bound preprocessing (34%), where the only big
 levers would be data layout / cache affinity — excluded by methodology.
 
+## Defects found and fixed (October 2026 audit)
+
+A line-by-line read of `src/chd.c`, plus an ASan run, found four real defects.
+Only one of them ever changed a distance; the rest were memory-safety and
+undefined-behaviour bugs that happened to be harmless on this path.
+
+1. **Heap-use-after-free in the DS' pool** (`dstr_alloc`/`dstr_recycle`).
+   Recycled `DStr` headers lived *inside* the pool array, so a live DStr handed
+   back through `ret->D` pointed into a buffer that the next `dstr_recycle` could
+   `xrealloc` out from under it — the following `*D` copy then read freed
+   memory (ASan: `heap-use-after-free`, 3024 bytes inside the 64-entry pool).
+   The 48-byte header is now always its own malloc (stable address) and only
+   the `blist` buffers are pooled.
+2. **Out-of-bounds write in BM.12** (the `c.Si` expansion). `Si` was sized from
+   the pull count `cnt`, but the expansion appends one entry per surviving
+   group member, and `partition_tree` only cuts a group when `|Uv| >= s`, so a
+   group can reach the size of a whole tree. When `cnt << |group|` the append
+   ran past the buffer. Reachable whenever `L >= 2` — which the adaptive `t`
+   never produces, for any `n` it builds.
+3. **Stale `k` in `chd_params`.** Forcing `3k <= t` grew `t` but kept the `k`
+   derived from the *old* `t`, so `t = 4` ran with `k = 2` and produced **wrong
+   distances** — 197.11 where Dijkstra says 148.08, at n = 30000. `k` is now
+   re-derived inside the growth loop.
+4. **Undefined shift in `chd_params`.** The first `Mtab[l]` store was dead (both
+   branches below overwrote it) yet still evaluated `(double)(1u << t)`, which
+   is undefined for the shift counts >= 32 that the adaptive `t` reaches from
+   n = 2^17 up. MSVC masks the count mod 32, so the dead value never showed.
+
+Defects 2 and 3 live only in the multi-level regime, which is why the suite now
+forces `t = 1..20` through `chd_set_t_override` (`test_t_sweep`) — it is the only
+coverage of BM.12's expansion, Pull splits and DS' merges. The suite grew from
+126 to 146 checks, and it is the change that exposed both.
+
+The audit also dropped state that was written but never read: the label version
+counter `ver[]` (incremented on **every** relax and never consulted — the banner
+already said so), the `valst[]` stamp array, and `FPB.Wl`. Plus three small
+wins in the measured hot paths: `slot_sort` allocates its gather scratch once
+per preprocess instead of a malloc/free pair per chunk, the two settle-scan
+loops skip vertices whose static range is already exhausted (`ptr[u] == e` is a
+provable no-op), and the base case feeds `cand` to the heap instead of reloading
+`W->d[v]`.
+
+Measured with the interleaved A/B described above — the same graph per cell,
+both binaries alternating across 3 rounds, DMMSY and Dijkstra re-measured on
+*both* binaries as drift controls: **−2.7%** in one session and **−1.0%** in
+another, against a control drift of +0.5%/+1.8% (DMMSY) and −1.0%/−0.5%
+(Dijkstra), with per-cell swings reaching ±12%. The honest reading: a small
+improvement that points the same way in every cell on average but sits close to
+this machine's noise floor. It is **not** a headline speedup, and it does not
+change the verdict below — the dominant cost is still the 16-byte-label Dijkstra
+and the memory-bound preprocessing.
+
 ## Benchmark methodology (honest, no cache tuning)
 
 - One seeded random graph per `(n, density)` cell, **shared** by all three
   algorithms; weights uniform in (0, 100].
 - The first run of each algorithm in each cell is **verified against
-  reference Dijkstra** (exact distances; the suite's 126 checks cover small
+  reference Dijkstra** (exact distances; the suite's 146 checks cover small
   graphs, zero weights, cycles and parallel edges).
 - 5 timed repetitions, **interleaved round-robin** (C-HD, DMMSY, Dijkstra)
   per cell; we report min and median. `reps < 2` is raised to 2 (min/median
@@ -202,7 +255,7 @@ src/bellman_ford.c   verified fallback outside the window
 src/chd.c            the full algorithm (~1900 lines, commented per section)
 src/benchmark.c      honest-comparison driver
 ref-dmmsy/           DMMSY-SSSP upstream, compiled verbatim (git submodule)
-tests/test_chd.c     suite: 126 checks vs Dijkstra + clean ASan
+tests/test_chd.c     suite: 146 checks vs Dijkstra + clean ASan
 results/             final CSV + figures
 ref-chd-proof/       paper draft and Lean spec (git submodule of the public proof repo)
 ```
