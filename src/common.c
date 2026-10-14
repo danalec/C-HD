@@ -23,7 +23,9 @@ static inline double rng_double(Rng *r) { /* [0,1) */
     return (double)(rng_next(r) >> 11) * (1.0 / 9007199254740992.0);
 }
 static inline node_t rng_below(Rng *r, node_t n) {
-    return (node_t)(rng_next(r) % n);
+    /* n == 0 is a valid (degenerate) graph size -- dijkstra_ref and
+     * chd_preprocess both accept it -- so the helper must not divide by it. */
+    return n ? (node_t)(rng_next(r) % n) : 0u;
 }
 
 /* ---------------- timing ---------------- */
